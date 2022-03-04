@@ -4,6 +4,8 @@ The code creates multiplicative forcing error for precipitation, longwave raditi
 Accounts for spatial and temporal correlation, and correlation among precipitation, solar and long wave raditions accounted for. 
 
 # Dependencides
-Eigen https://eigen.tuxfamily.org/index.php?title=Main_Page
+Eigen https://eigen.tuxfamily.org/index.php?title=Main_Page 
+
 netCDF https://www.unidata.ucar.edu/software/netcdf/
+
 any MPI library, e.g., MPICH https://www.mpich.org/
