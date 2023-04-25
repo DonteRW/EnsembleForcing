@@ -54,8 +54,10 @@
     ! character*1  :: ntile_out_str
     integer :: comm
 
-    real(kind=4),allocatable,dimension(:,:) :: workg,tile_number
-    real(kind=4),allocatable,dimension(:,:,:) :: workg3d
+!4.25.23 these below are not being used
+    ! real(kind=4),allocatable,dimension(:,:) :: workg,tile_number
+    ! real(kind=4),allocatable,dimension(:,:,:) :: workg3d
+
     real(kind=4),allocatable,dimension(:) :: grid_xt,grid_yt
     real(kind=kind_phys), dimension(:,:),   allocatable, save :: xlat
     real(kind=kind_phys), dimension(:,:),   allocatable, save :: xlon
@@ -83,7 +85,8 @@
     ! Integer, intent(in)   :: LENS_OUT, num_ens
     ! Real, intent(out)     :: vector_rand_ens(LENS_OUT)
     Real, allocatable     :: vector_rand_ens(:)
-    INTEGER :: IDIM, JDIM, NUM_TILES, IY, IM, ID, IH
+    INTEGER :: IDIM, JDIM, NUM_TILES, IY, IM, ID, IH, &
+               i_layout, j_layout, tot_subtiles, my_tile
     REAL    :: FH, DELTSFC
     ! INTEGER :: IERR
     INTEGER :: NPROCS, MYRANK, NUM_THREADS, NUM_PARTHDS, MAX_TASKS
@@ -118,6 +121,7 @@
     integer, allocatable   :: tile_members(:,:), tile_group(:), comm_tile(:)
     integer                :: group_world  !, comm_tile !comm_world, 
     integer                :: Np_ext, Np_til, p_gN, p_gRank
+    integer, allocatable   :: pg_bindx(:,:)
 
     LOGICAL             :: file_exists
     Integer             :: error, varid !ncid, 
@@ -133,14 +137,14 @@
 
     character(len=500)      :: stoch_ini_file !11.8.21 TZG input init pattern file
 
-    NAMELIST/NAMSNO/ IDIM, JDIM, NUM_TILES, IY, IM, ID, IH, FH, DELTSFC, &
+    NAMELIST/NAMSNO/ IDIM, JDIM, NUM_TILES, i_layout, j_layout, IY, IM, ID, IH, FH, DELTSFC, &
                     horz_len_scale, ver_len_scale, temp_len_scale, ens_size, &
                     t_len, t_indx, &
                     static_filename, fv3_prefix, vector_prefix, rand_var, &
                     PRINTRANK, print_debg_info, n_surf_vars, &
                     vector_size, forc_inp_path, forc_inp_file, std_dev_f             
     !
-    DATA IDIM,JDIM,NUM_TILES/96,96,6/ 
+    DATA IDIM,JDIM,NUM_TILES, i_layout, j_layout/96,96,6, 1, 1/ 
     DATA IY,IM,ID,IH,FH/1997,8,2,0,0./
     DATA DELTSFC/0.0/, MAX_TASKS/99999/
     DATA horz_len_scale/55.0/
@@ -216,7 +220,7 @@
     ! READ(360, NML=NAMSNO)
     close(360)    
     IF (MYRANK==0) WRITE(6, NAMSNO)
-    LENSFC = IDIM*JDIM ! TOTAL NUMBER OF POINTS FOR THE CUBED-SPHERE TILE
+    ! LENSFC = IDIM*JDIM ! TOTAL NUMBER OF POINTS FOR THE CUBED-SPHERE TILE
     
     !   comm_world = comm_world
     my_id=mpp_pe()
@@ -225,25 +229,53 @@
     ! print*, "proc ", my_id, " of ", ntasks
     CALL MPI_BARRIER(MPI_COMM_WORLD, IERR)
 
-    Np_ext = MOD(NPROCS, NUM_TILES)  ! extra/inactive procs
+    rsize = SIZEOF(horz_len_scale)
+    Call MPI_TYPE_SIZE(MPI_REAL, mpiReal_size, IERR) 
+    If (rsize == 4 ) then 
+            mpiReal_size = MPI_REAL4
+    elseif (rsize == 8 ) then 
+            mpiReal_size = MPI_REAL8
+    elseif (rsize == 16 ) then 
+            mpiReal_size = MPI_REAL16
+    else
+            PRINT*," Possible mismatch between Fortran Real ", rsize," and Mpi Real ", mpiReal_size
+            Stop
+    endif
+    isize = SIZEOF(vector_size) 
+    Call MPI_TYPE_SIZE(MPI_INTEGER, mpiInt_size, IERR) 
+    If (isize == 2 ) then 
+        mpiInt_size = MPI_INTEGER2
+    elseif (isize == 4 ) then 
+        mpiInt_size = MPI_INTEGER4
+    elseif (isize == 8 ) then 
+        mpiInt_size = MPI_INTEGER8
+    else
+        PRINT*," Possible mismatch between Fortran Int ", isize," and Mpi Int ", mpiInt_size
+        Stop
+    endif
+    
+    tot_subtiles = NUM_TILES * i_layout * j_layout
+
+    Np_ext = MOD(NPROCS, tot_subtiles)  ! extra/inactive procs
     if (MYRANK >  NPROCS - Np_ext - 1) goto 999
 
-    Np_til = NPROCS / NUM_TILES  ! num tile groups    
-    p_gN = MYRANK / NUM_TILES  ! group for proc.  
-    p_gRank = MOD(MYRANK, NUM_TILES)  ! proc. rank within group
+    Np_til = NPROCS / tot_subtiles  ! num tile groups    
+    p_gN = MYRANK / tot_subtiles  ! group for proc.  
+    p_gRank = MOD(MYRANK, tot_subtiles)  ! proc. rank within group
     
-    Allocate(tile_members(Np_til, NUM_TILES))
+    Allocate(tile_members(Np_til, tot_subtiles))
     Allocate(tile_group(Np_til))
-    Allocate(comm_tile(Np_til))    
+    Allocate(comm_tile(Np_til))  
+      
     do ixy = 0, Np_til - 1   
-        Do ipr = 0, NUM_TILES-1
-            tile_members(ixy+1, ipr+1) = ixy*NUM_TILES + ipr   !(/ixy*NUM_TILES + ipr, ipr=0,NUM_TILES-1/)
+        Do ipr = 0, tot_subtiles-1
+            tile_members(ixy+1, ipr+1) = ixy*tot_subtiles + ipr   !(/ixy*NUM_TILES + ipr, ipr=0,NUM_TILES-1/)
         enddo
     enddo
     ! tile_members(1,:) = (/0, 1, 2, 3, 4, 5/)
     ! tile_members(2,:) = (/6, 7, 8, 9, 10, 11/)
     do ixy = 0, Np_til - 1   
-        call MPI_Group_incl(group_world, NUM_TILES, tile_members(ixy+1,:), &
+        call MPI_Group_incl(group_world, tot_subtiles, tile_members(ixy+1,:), &
                            tile_group(ixy+1), IERR)
          call MPI_Comm_create(MPI_COMM_WORLD, tile_group(ixy+1), comm_tile(ixy+1), IERR)
     enddo    
@@ -301,14 +333,34 @@
     jec=Atm(1)%bd%jec
     nx=iec-isc+1
     ny=jec-jsc+1
-    allocate(workg(nx,ny))
-    allocate(tile_number(nx,ny))
-    allocate(workg3d(nx,ny,nlevs))
+
+    ! allocate(workg(nx,ny))
+    ! allocate(tile_number(nx,ny))
+    ! allocate(workg3d(nx,ny,nlevs))
 
     if (p_gRank==0) then
-        print*, " pe group", p_gN + 1
+        print*, "pe group", p_gN + 1
         print*,'nx, ny=',nx,ny
     endif
+    
+    my_tile = Atm(1)%tile_of_mosaic
+    if (MYRANK ==0) print*, "size(Atm)", size(Atm), "npes_per_tile", Atm(1)%npes_per_tile, &
+                    "tile_of_mosaic", my_tile  ! A Atm(1)%global_tile, 
+
+    print*, "proc , isc,iec,jsc,jec,isd,ied,jsd,jed"
+    print*, myrank, isc,iec,jsc,jec,isd,ied,jsd,jed
+
+    Allocate(pg_bindx(tot_subtiles, 5))
+    if (p_gRank /= 0) then  
+        call MPI_SEND((/my_tile, isc,iec,jsc,jec/), 5, mpiInt_size, 0, &
+                        10*(p_gRank+1), comm_tile(p_gN+1), IERR) 
+    else
+        pg_bindx(1,:) = (/my_tile, isc,iec,jsc,jec/)        
+        Do iproc = 1, tot_subtiles-1 
+            call MPI_RECV(pg_bindx(iproc+1,:), 5, mpiInt_size, &
+            iproc, 10*(iproc+1), comm_tile(p_gN+1), MPI_STATUS_IGNORE, IERR)
+        Enddo
+    End if
 
     blksz_1=nx
     nblks=nx*ny/blksz_1
@@ -353,6 +405,14 @@
         endif
     end do
     
+    if (p_gRank==0) then
+        print*, "MYRANK",  MYRANK, "pe group", p_gN + 1, "min max xlon", &
+        minval(xlon), maxval(xlon)
+       
+        print*, "MYRANK",  MYRANK, "pe group", p_gN + 1, "min max xlat", &
+        minval(xlat), maxval(xlat)
+    endif
+    
     allocate(grid_xt(nx),grid_yt(ny))
     do i=1,nx
     grid_xt(i)=i
@@ -371,30 +431,6 @@
     ! forc_var_list(6) = "specific_humidity"
     ! forc_var_list(7) = "wind_speed"
     ! forc_var_list(8) = "surface_pressure"     
-    rsize = SIZEOF(horz_len_scale)
-    Call MPI_TYPE_SIZE(MPI_REAL, mpiReal_size, IERR) 
-    If (rsize == 4 ) then 
-            mpiReal_size = MPI_REAL4
-    elseif (rsize == 8 ) then 
-            mpiReal_size = MPI_REAL8
-    elseif (rsize == 16 ) then 
-            mpiReal_size = MPI_REAL16
-    else
-            PRINT*," Possible mismatch between Fortran Real ", rsize," and Mpi Real ", mpiReal_size
-            Stop
-    endif
-    isize = SIZEOF(vector_size) 
-    Call MPI_TYPE_SIZE(MPI_INTEGER, mpiInt_size, IERR) 
-    If (isize == 2 ) then 
-        mpiInt_size = MPI_INTEGER2
-    elseif (isize == 4 ) then 
-        mpiInt_size = MPI_INTEGER4
-    elseif (isize == 8 ) then 
-        mpiInt_size = MPI_INTEGER8
-    else
-        PRINT*," Possible mismatch between Fortran Int ", isize," and Mpi Int ", mpiInt_size
-        Stop
-    endif
 
     ! vector_size = LENS_OUT
     allocate(tile_xy(vector_size))
@@ -422,11 +458,11 @@
 
     ! allocate(rand_Ta(LENSFC), rand_Prec(LENSFC), rand_sRad(LENSFC))
     ! allocate(rand_lRad(LENSFC),rand_sHum(LENSFC), rand_wSpeed(LENSFC))
-    allocate(rand_Ta3D(6, IDIM, JDIM))
+    allocate(rand_Ta3D(6, JDIM, IDIM))
     
     ! Read fv3    
     !workg_T162_984x488.tile03.nc 
-    allocate(sfc_wts_out(JDIM, IDIM, n_surf_vars))
+    allocate(sfc_wts_out(JDIM / j_layout, IDIM / i_layout, n_surf_vars))
     allocate(forcArray(vector_size))  !, t_len))
     allocate(vector_rand_ens(vector_size))  !, t_len))
 
@@ -496,7 +532,7 @@
         stoch_ini_file = TRIM(forc_inp_path)//'/RESTART/stochy_final_ens'//TRIM(ensCH)//'.nc'
         if (p_gRank == 0) then  
             forc_inp_file_ens=TRIM(forc_inp_path)//"/ens"//TRIM(ensCH)//"/"//TRIM(forc_inp_file)
-            ! REstart file
+            ! forcing file
             INQUIRE(FILE=trim(forc_inp_file_ens), EXIST=file_exists)
             if (.not. file_exists) then 
                 print *, 'error,file does not exist', &   
@@ -504,7 +540,7 @@
                 call MPI_ABORT(MPI_COMM_WORLD, 10, IERR) ! CSD - add proper error trapping?
             endif
             error = nf90_open(trim(forc_inp_file_ens), NF90_WRITE, ncid)
-            call netcdf_err(error, 'opening restart file' )
+            call netcdf_err(error, 'opening forcing file' )
         endif
         ! IF (p_gRank==0) PRINT*," calling stand alone stochy, ens ", ie
         do_sppt=.false.
@@ -527,7 +563,8 @@
         
         Do it=1, t_len
             call run_stochastic_physics(nlevs, it-1, fhour, blksz, &
-                                        sppt_wts=sppt_wts, shum_wts=shum_wts, skebu_wts=skebu_wts, skebv_wts=skebv_wts, sfc_wts=sfc_wts, &
+                        sppt_wts=sppt_wts, shum_wts=shum_wts, skebu_wts=skebu_wts, &
+                                        skebv_wts=skebv_wts, sfc_wts=sfc_wts, &
                                         nthreads=nthreads)
             ! do l=1,n_var_lndp
             !     do j=1,ny
@@ -549,12 +586,17 @@
 
             Do ixy = 1, n_surf_vars        !vector_length 
                 if (p_gRank /= 0) then  
-                    call MPI_SEND(sfc_wts_out(:,:,ixy), JDIM*IDIM, mpiReal_size, 0, &
+                    call MPI_SEND(sfc_wts_out(:,:,ixy), JDIM*IDIM/(j_layout*i_layout), mpiReal_size, 0, &
                                     10*(p_gRank+1)+ixy, comm_tile(p_gN+1), IERR) 
                 else
-                    rand_Ta3D(1,:,:) = sfc_wts_out(:,:,ixy)
-                    Do iproc = 1, NUM_TILES-1 
-                        call MPI_RECV(rand_Ta3D(iproc+1,:,:),JDIM*IDIM, mpiReal_size, &
+!rand_Ta3D(6, JDIM * j_layout, IDIM * i_layout))
+                    ! isc,iec,jsc,jec             
+                    rand_Ta3D(my_tile,jsc:jec,isc:iec) = sfc_wts_out(:,:,ixy)
+                    Do iproc = 1, tot_subtiles-1 
+                        ! call MPI_RECV(rand_Ta3D(iproc+1,:,:),JDIM*IDIM, mpiReal_size, &
+                        call MPI_RECV(rand_Ta3D(pg_bindx(iproc+1,1), pg_bindx(iproc+1,2):pg_bindx(iproc+1,3), &
+                                                pg_bindx(iproc+1,4):pg_bindx(iproc+1,5)), &
+                                                JDIM*IDIM/(j_layout*i_layout), mpiReal_size, &                        
                         iproc, 10*(iproc+1)+ixy, comm_tile(p_gN+1), MPI_STATUS_IGNORE, IERR)
                     Enddo
                     Do iv=1, vector_size 
@@ -629,6 +671,8 @@
     Deallocate(tile_members)
     Deallocate(tile_group)
     Deallocate(comm_tile)
+
+    DEAllocate(pg_bindx)
 
     deallocate(tile_xy)
     deallocate(Idim_xy)
